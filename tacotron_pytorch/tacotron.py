@@ -164,6 +164,9 @@ class Decoder(nn.Module):
 
         self.decoder_rnns = nn.ModuleList(
             [nn.GRUCell(256, 256) for _ in range(2)])
+        #self.decoder_cnns = nn.ModuleList(
+        #   [CNN_layer(256) for _ in range(2)] )
+
 
         self.proj_to_mel = nn.Linear(256, in_dim * r)
         self.max_decoder_steps = 200
@@ -317,3 +320,19 @@ class Tacotron(nn.Module):
         linear_outputs = self.last_linear(linear_outputs)
 
         return mel_outputs, linear_outputs, alignments
+
+class CNN_layer(nn.Module):
+    def __init__(self, input_dim, k_size=5):
+        super(CNN_layer, self).__init__()
+        self.input_dim = input_dim
+        self.k_size = k_size
+        
+        self.conv=nn.Conv1d(input_dim, input_dim*2, kernel_size=k_size, padding=(k_size-1, 0))
+    def forward(self, x):
+        y=self.conv(x)
+        y = F.glu(y)
+
+        return (y+x)*((0.5)**0.5)
+
+
+   
