@@ -170,20 +170,13 @@ def _learning_rate_decay(init_lr, global_step):
     return lr
 
 
-def save_states(global_step, mel_outputs, linear_outputs, attn, y,
+def save_states(global_step, mel_outputs, linear_outputs, y,
                 input_lengths, checkpoint_dir=None):
     print("Save intermediate states at step {}".format(global_step))
 
     # idx = np.random.randint(0, len(input_lengths))
     idx = min(1, len(input_lengths) - 1)
     input_length = input_lengths[idx]
-
-    # Alignment
-    path = join(checkpoint_dir, "step{}_alignment.png".format(
-        global_step))
-    # alignment = attn[idx].cpu().data.numpy()[:, :input_length]
-    alignment = attn[idx].cpu().data.numpy()
-    save_alignment(path, alignment)
 
     # Predicted spectrogram
     path = join(checkpoint_dir, "step{}_predicted_spectrogram.png".format(
@@ -237,7 +230,7 @@ def train(model, data_loader, optimizer,
             x, mel, y = Variable(x), Variable(mel), Variable(y)
             if use_cuda:
                 x, mel, y = x.cuda(), mel.cuda(), y.cuda()
-            mel_outputs, linear_outputs, attn = model(
+            mel_outputs, linear_outputs = model(
                 x, mel, input_lengths=sorted_lengths)
 
             # Loss
@@ -250,7 +243,7 @@ def train(model, data_loader, optimizer,
 
             if global_step > 0 and global_step % checkpoint_interval == 0:
                 save_states(
-                    global_step, mel_outputs, linear_outputs, attn, y,
+                    global_step, mel_outputs, linear_outputs, y,
                     sorted_lengths, checkpoint_dir)
                 save_checkpoint(
                     model, optimizer, global_step, checkpoint_dir, global_epoch)

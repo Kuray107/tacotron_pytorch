@@ -149,29 +149,32 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, in_dim, r):
+    def __init__(self, in_dim):
         super(Decoder, self).__init__()
         self.in_dim = in_dim
-        self.r = r
-        self.prenet = Prenet(in_dim * r, sizes=[256, 128])
         # (prenet_out + attention context) -> output
-        self.attention_rnn = AttentionWrapper(
-            nn.GRUCell(256 + 128, 256),
-            BahdanauAttention(256)
-        )
         self.memory_layer = nn.Linear(256, 256, bias=False)
         self.project_to_decoder_in = nn.Linear(512, 256)
 
-        self.decoder_rnns = nn.ModuleList(
-            [nn.GRUCell(256, 256) for _ in range(2)])
-        #self.decoder_cnns = nn.ModuleList(
-        #   [CNN_layer(256) for _ in range(2)] )
+        self.Attention = nn.ModuleList(
+            Attention(256, 256)
+            Attention(256, 256)
+            Attention(256, 256)
+            Attention(256, 256)
+        )
 
+        self.decoder_cnns = nn.ModuleList(
+            CNN_layer(256),
+            CNN_layer(256), 
+            CNN_layer(256), 
+            CNN_layer(256), 
+            CNN_layer(256), 
+        )
 
-        self.proj_to_mel = nn.Linear(256, in_dim * r)
+        self.proj_to_mel = nn.Linear(256, in_dim)
         self.max_decoder_steps = 200
 
-    def forward(self, encoder_outputs, inputs=None, memory_lengths=None):
+    def forward(self, encoder_outputs, inputs=None, first_embedding, memory_lengths=None, parallel=False):
         """
         Decoder forward step.
 
@@ -197,81 +200,52 @@ class Decoder(nn.Module):
         greedy = inputs is None
 
         if inputs is not None:
-            # Grouping multiple frames if necessary
-            if inputs.size(-1) == self.in_dim:
-                inputs = inputs.view(B, inputs.size(1) // self.r, -1)
-            assert inputs.size(-1) == self.in_dim * self.r
             T_decoder = inputs.size(1)
 
         # go frames
-        initial_input = Variable(
-            encoder_outputs.data.new(B, self.in_dim * self.r).zero_())
-
-        # Init decoder states
-        attention_rnn_hidden = Variable(
-            encoder_outputs.data.new(B, 256).zero_())
-        decoder_rnn_hiddens = [Variable(
-            encoder_outputs.data.new(B, 256).zero_())
-            for _ in range(len(self.decoder_rnns))]
-        current_attention = Variable(
-            encoder_outputs.data.new(B, 256).zero_())
-
-        # Time first (T_decoder, B, in_dim)
-        if inputs is not None:
-            inputs = inputs.transpose(0, 1)
-
-        outputs = []
-        alignments = []
+        initial_input = Variable(torch.zeros(B, 1, self.in_dim))
 
         t = 0
         current_input = initial_input
-        while True:
-            if t > 0:
-                current_input = outputs[-1] if greedy else inputs[t - 1]
-            # Prenet
-            current_input = self.prenet(current_input)
 
-            # Attention RNN
-            attention_rnn_hidden, current_attention, alignment = self.attention_rnn(
-                current_input, current_attention, attention_rnn_hidden,
-                encoder_outputs, processed_memory=processed_memory, mask=mask)
+        if inputs is not None:
+            layer_output = inputs = torch.cat((initial_inputs, inputs)
+            for idx in range(len(self.decoder_cnns)):
+                layer_output = self.decoder_cnns[idx](layer_output)
+                if idx < len(self.decoder_cnns)-1:
+                    output = self.Attention[idx](layer_output, encoder_output, inputs, first_embedding)
+                    layer_output += output
 
-            # Concat RNN output and attention context vector
-            decoder_input = self.project_to_decoder_in(
-                torch.cat((attention_rnn_hidden, current_attention), -1))
+            outputs = layer_output
+            outputs = self.proj_to_mel(outputs)
 
-            # Pass through the decoder RNNs
-            for idx in range(len(self.decoder_rnns)):
-                decoder_rnn_hiddens[idx] = self.decoder_rnns[idx](
-                    decoder_input, decoder_rnn_hiddens[idx])
-                # Residual connectinon
-                decoder_input = decoder_rnn_hiddens[idx] + decoder_input
 
-            output = decoder_input
-            output = self.proj_to_mel(output)
+        else:
+            hidden_layers = [Variable(torch.zeros(B, 4, self.in_dim)) for i in range(4)]
+            outputs = Variable(torch.zeros(B, 5, self.in_dim))
 
-            outputs += [output]
-            alignments += [alignment]
+            while True:
+                layer_output = current_input = outputs[:, -5:, :]
+                for idx in range(len(self.decoder_cnns)):
+                    hidden_output = self.decoder_cnns[idx](layer_output)
+                    if idx < len(self.decoder_cnns)-1:
+                        hidden_layers[idx] = torch.cat((hidden_layers[idx], hidden_output), axis = 1)
+                        layer_output = hidden_layers[idx][:, -5:, :]
+                        output = self.Attention[idx](layer_output, encoder_output, current_inputs, first_embedding)
+                        layer_output += output
+                    else:
+                        final_output = self.proj_to_mel(hidden_output)
+                        outputs = torch.cat((outputs, final_output), axis = 1)
 
-            t += 1
+                t += 1
 
-            if greedy:
                 if t > 1 and is_end_of_frames(output):
                     break
                 elif t > self.max_decoder_steps:
                     print("Warning! doesn't seems to be converged")
                     break
-            else:
-                if t >= T_decoder:
-                    break
 
-        assert greedy or len(outputs) == T_decoder
-
-        # Back to batch first
-        alignments = torch.stack(alignments).transpose(0, 1)
-        outputs = torch.stack(outputs).transpose(0, 1).contiguous()
-
-        return outputs, alignments
+        return outputs
 
 
 def is_end_of_frames(output, eps=0.2):
@@ -290,7 +264,7 @@ class Tacotron(nn.Module):
         # Trying smaller std
         self.embedding.weight.data.normal_(0, 0.3)
         self.encoder = Encoder(embedding_dim)
-        self.decoder = Decoder(mel_dim, r)
+        self.decoder = Decoder(mel_dim)
 
         self.postnet = CBHG(mel_dim, K=8, projections=[256, mel_dim])
         self.last_linear = nn.Linear(mel_dim * 2, linear_dim)
@@ -307,8 +281,8 @@ class Tacotron(nn.Module):
         else:
             memory_lengths = None
         # (B, T', mel_dim*r)
-        mel_outputs, alignments = self.decoder(
-            encoder_outputs, targets, memory_lengths=memory_lengths)
+        mel_outputs = self.decoder(
+            encoder_outputs, targets, inputs, memory_lengths=memory_lengths)
 
         # Post net processing below
 
@@ -319,7 +293,7 @@ class Tacotron(nn.Module):
         linear_outputs = self.postnet(mel_outputs)
         linear_outputs = self.last_linear(linear_outputs)
 
-        return mel_outputs, linear_outputs, alignments
+        return mel_outputs, linear_outputs
 
 class CNN_layer(nn.Module):
     def __init__(self, input_dim, k_size=5):
@@ -327,12 +301,33 @@ class CNN_layer(nn.Module):
         self.input_dim = input_dim
         self.k_size = k_size
         
-        self.conv=nn.Conv1d(input_dim, input_dim*2, kernel_size=k_size, padding=(k_size-1, 0))
-    def forward(self, x):
-        y=self.conv(x)
-        y = F.glu(y)
+        self.conv=nn.Conv1d(input_dim, input_dim*2, kernel_size=k_size)
+    def forward(self, x, parallel = True):
+        if parallel:
+            inputs = torch.cat((torch.zeros(x.size(0), k_size-1, x.size(0)), x), dim = 1)
+        else: 
+            inputs = x 
+        inputs = inputs.transpose(1, 2)
+        y = self.conv(inputs)
+        y = F.glu(y.transpose(1, 2))
+        if parallel: 
+            return (y+x)*((0.5)**0.5)
+        else:
+            return (y+x[:, -1:, :])*((0.5)**0.5)
 
-        return (y+x)*((0.5)**0.5)
+
+class Attention(nn.Module):
+    def __init__(self, input_dim, encode_dim):
+        super(Attention, self).__init__()
+        self.input_dim = input_dim
+        self.encode_dim = encode_dim
+        self.layer = nn.Linear(input_dim, input_dim)
+    def forward(self, query, key, inputs, first_embedding):
+        output = nn.Linear(query) + inputs
+        attn = torch.bmm(output, key.transpoese(1, 2))
+        attn = F.softmax(attn, dim=2)
+        c_vector = torch.bmm(attn, key+first_embedding)
+        return c_vector
 
 
    
