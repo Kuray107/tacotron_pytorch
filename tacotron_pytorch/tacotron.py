@@ -3,10 +3,13 @@ from __future__ import with_statement, print_function, absolute_import
 
 import torch
 from torch.autograd import Variable
+import torch.nn.functional as F
 from torch import nn
 
 from .attention import BahdanauAttention, AttentionWrapper
 from .attention import get_mask_from_lengths
+import sys
+import math
 
 
 class Prenet(nn.Module):
@@ -95,7 +98,7 @@ class CBHG(nn.Module):
         # (B, T_in, in_dim)
         x = inputs
 
-        # Needed to perform conv1d on time-axis
+        # Needed to perform conv1d on time-dim
         # (B, in_dim, T_in)
         if x.size(-1) == self.in_dim:
             x = x.transpose(1, 2)
@@ -152,29 +155,23 @@ class Decoder(nn.Module):
     def __init__(self, in_dim):
         super(Decoder, self).__init__()
         self.in_dim = in_dim
+        self.linear = nn.Linear(in_dim, 256)
         # (prenet_out + attention context) -> output
         self.memory_layer = nn.Linear(256, 256, bias=False)
         self.project_to_decoder_in = nn.Linear(512, 256)
 
         self.Attention = nn.ModuleList(
-            Attention(256, 256)
-            Attention(256, 256)
-            Attention(256, 256)
-            Attention(256, 256)
+            [Attention(256, 256) for i in range(1)]
         )
 
         self.decoder_cnns = nn.ModuleList(
-            CNN_layer(256),
-            CNN_layer(256), 
-            CNN_layer(256), 
-            CNN_layer(256), 
-            CNN_layer(256), 
+            [CNN_layer(256) for i in range(2)]
         )
 
         self.proj_to_mel = nn.Linear(256, in_dim)
         self.max_decoder_steps = 200
 
-    def forward(self, encoder_outputs, inputs=None, first_embedding, memory_lengths=None, parallel=False):
+    def forward(self, encoder_outputs, first_embedding, inputs=None, memory_lengths=None, parallel=False):
         """
         Decoder forward step.
 
@@ -196,55 +193,55 @@ class Decoder(nn.Module):
         else:
             mask = None
 
-        # Run greedy decoding if inputs is None
-        greedy = inputs is None
-
         if inputs is not None:
             T_decoder = inputs.size(1)
 
         # go frames
-        initial_input = Variable(torch.zeros(B, 1, self.in_dim))
-
+        initial_input = Variable(torch.zeros(B, 1, 256)).cuda()
         t = 0
         current_input = initial_input
 
-        if inputs is not None:
-            layer_output = inputs = torch.cat((initial_inputs, inputs)
+
+        if parallel:
+            inputs = self.linear(inputs)
+            layer_output = inputs = torch.cat((initial_input, inputs), dim=1)
+            inputs = inputs[:, :-1, :]
+            layer_output = layer_output[:, :-1, :]
             for idx in range(len(self.decoder_cnns)):
-                layer_output = self.decoder_cnns[idx](layer_output)
+                layer_output = self.decoder_cnns[idx](layer_output, parallel=parallel)
                 if idx < len(self.decoder_cnns)-1:
-                    output = self.Attention[idx](layer_output, encoder_output, inputs, first_embedding)
-                    layer_output += output
+                    output = self.Attention[idx](layer_output, encoder_outputs, inputs, first_embedding)
+                    layer_output = layer_output + output
 
             outputs = layer_output
             outputs = self.proj_to_mel(outputs)
 
 
-        else:
-            hidden_layers = [Variable(torch.zeros(B, 4, self.in_dim)) for i in range(4)]
-            outputs = Variable(torch.zeros(B, 5, self.in_dim))
+        else: 
+            hidden_layers = [Variable(torch.zeros(B, 4, 256)).cuda() for i in range(4)]
+            outputs = Variable(torch.zeros(B, 5, self.in_dim)).cuda()
 
             while True:
-                layer_output = current_input = outputs[:, -5:, :]
+                layer_output = current_input = self.linear(outputs[:, -5:, :])
                 for idx in range(len(self.decoder_cnns)):
                     hidden_output = self.decoder_cnns[idx](layer_output)
                     if idx < len(self.decoder_cnns)-1:
-                        hidden_layers[idx] = torch.cat((hidden_layers[idx], hidden_output), axis = 1)
-                        layer_output = hidden_layers[idx][:, -5:, :]
-                        output = self.Attention[idx](layer_output, encoder_output, current_inputs, first_embedding)
-                        layer_output += output
+                        hidden_layers[idx] = torch.cat((hidden_layers[idx], hidden_output), dim = 1)
+                        hidden_layers[idx] = layer_output = hidden_layers[idx][:, -5:, :]
+                        output = self.Attention[idx](layer_output, encoder_outputs, current_input, first_embedding)
+                        layer_output = layer_output + output
                     else:
                         final_output = self.proj_to_mel(hidden_output)
-                        outputs = torch.cat((outputs, final_output), axis = 1)
-
-                t += 1
+                        outputs = torch.cat((outputs, final_output), dim = 1)
+                    
+                t = t + 1
 
                 if t > 1 and is_end_of_frames(output):
                     break
-                elif t > self.max_decoder_steps:
-                    print("Warning! doesn't seems to be converged")
+                elif t == 1000:
+                    # print("Warning! doesn't seems to be converged")
                     break
-
+            outputs = outputs[:, 4:, :]
         return outputs
 
 
@@ -254,7 +251,7 @@ def is_end_of_frames(output, eps=0.2):
 
 class Tacotron(nn.Module):
     def __init__(self, n_vocab, embedding_dim=256, mel_dim=80, linear_dim=1025,
-                 r=5, padding_idx=None, use_memory_mask=False):
+                 r=5, padding_idx=None, use_memory_mask=False, parallel=True):
         super(Tacotron, self).__init__()
         self.mel_dim = mel_dim
         self.linear_dim = linear_dim
@@ -268,6 +265,7 @@ class Tacotron(nn.Module):
 
         self.postnet = CBHG(mel_dim, K=8, projections=[256, mel_dim])
         self.last_linear = nn.Linear(mel_dim * 2, linear_dim)
+        self.parallel = parallel
 
     def forward(self, inputs, targets=None, input_lengths=None):
         B = inputs.size(0)
@@ -282,7 +280,7 @@ class Tacotron(nn.Module):
             memory_lengths = None
         # (B, T', mel_dim*r)
         mel_outputs = self.decoder(
-            encoder_outputs, targets, inputs, memory_lengths=memory_lengths)
+            encoder_outputs, inputs, targets, memory_lengths=memory_lengths, parallel=self.parallel)
 
         # Post net processing below
 
@@ -302,18 +300,21 @@ class CNN_layer(nn.Module):
         self.k_size = k_size
         
         self.conv=nn.Conv1d(input_dim, input_dim*2, kernel_size=k_size)
-    def forward(self, x, parallel = True):
+    def forward(self, x, parallel=False):
         if parallel:
-            inputs = torch.cat((torch.zeros(x.size(0), k_size-1, x.size(0)), x), dim = 1)
+            padding = Variable(torch.zeros(x.size(0), self.k_size-1, x.size(2))).cuda()
+            inputs = torch.cat((padding, x), dim = 1)
         else: 
             inputs = x 
         inputs = inputs.transpose(1, 2)
         y = self.conv(inputs)
         y = F.glu(y.transpose(1, 2))
+        k = math.sqrt(2)
         if parallel: 
-            return (y+x)*((0.5)**0.5)
+            return (y+x) / k
         else:
-            return (y+x[:, -1:, :])*((0.5)**0.5)
+            
+            return (y+x[:, -1:, :]) / k
 
 
 class Attention(nn.Module):
@@ -323,8 +324,8 @@ class Attention(nn.Module):
         self.encode_dim = encode_dim
         self.layer = nn.Linear(input_dim, input_dim)
     def forward(self, query, key, inputs, first_embedding):
-        output = nn.Linear(query) + inputs
-        attn = torch.bmm(output, key.transpoese(1, 2))
+        output = self.layer(query) #+ inputs
+        attn = torch.bmm(output, key.transpose(1, 2))
         attn = F.softmax(attn, dim=2)
         c_vector = torch.bmm(attn, key+first_embedding)
         return c_vector

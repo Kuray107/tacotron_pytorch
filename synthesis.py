@@ -51,16 +51,15 @@ def tts(model, text):
         sequence = sequence.cuda()
 
     # Greedy decoding
-    mel_outputs, linear_outputs, alignments = model(sequence)
+    mel_outputs, linear_outputs = model(sequence)
 
     linear_output = linear_outputs[0].cpu().data.numpy()
     spectrogram = audio._denormalize(linear_output)
-    alignment = alignments[0].cpu().data.numpy()
 
     # Predicted audio signal
     waveform = audio.inv_spectrogram(linear_output.T)
 
-    return waveform, alignment, spectrogram
+    return waveform, spectrogram
 
 
 if __name__ == "__main__":
@@ -79,6 +78,7 @@ if __name__ == "__main__":
                      r=hparams.outputs_per_step,
                      padding_idx=hparams.padding_idx,
                      use_memory_mask=hparams.use_memory_mask,
+                     parallel=False
                      )
     checkpoint = torch.load(checkpoint_path)
     model.load_state_dict(checkpoint["state_dict"])
@@ -92,11 +92,8 @@ if __name__ == "__main__":
             text = line.decode("utf-8")[:-1]
             words = nltk.word_tokenize(text)
             print("{}: {} ({} chars, {} words)".format(idx, text, len(text), len(words)))
-            waveform, alignment, _ = tts(model, text)
+            waveform, _ = tts(model, text)
             dst_wav_path = join(dst_dir, "{}{}.wav".format(idx, file_name_suffix))
-            dst_alignment_path = join(dst_dir, "{}_alignment.png".format(idx))
-            plot_alignment(alignment.T, dst_alignment_path,
-                           info="tacotron, {}".format(checkpoint_path))
             audio.save_wav(waveform, dst_wav_path)
 
     print("Finished! Check out {} for generated audio samples.".format(dst_dir))

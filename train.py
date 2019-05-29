@@ -147,11 +147,6 @@ def collate_fn(batch):
     y_batch = torch.FloatTensor(c)
     return x_batch, input_lengths, mel_batch, y_batch
 
-
-def save_alignment(path, attn):
-    plot_alignment(attn.T, path, info="tacotron, step={}".format(global_step))
-
-
 def save_spectrogram(path, linear_output):
     spectrogram = audio._denormalize(linear_output)
     plt.figure(figsize=(16, 10))
@@ -232,7 +227,7 @@ def train(model, data_loader, optimizer,
                 x, mel, y = x.cuda(), mel.cuda(), y.cuda()
             mel_outputs, linear_outputs = model(
                 x, mel, input_lengths=sorted_lengths)
-
+            
             # Loss
             mel_loss = criterion(mel_outputs, mel)
             n_priority_freq = int(3000 / (fs * 0.5) * linear_dim)
@@ -250,19 +245,19 @@ def train(model, data_loader, optimizer,
 
             # Update
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), clip_thresh)
             optimizer.step()
 
             # Logs
-            log_value("loss", float(loss.data[0]), global_step)
-            log_value("mel loss", float(mel_loss.data[0]), global_step)
-            log_value("linear loss", float(linear_loss.data[0]), global_step)
+            log_value("loss", float(loss.item()), global_step)
+            log_value("mel loss", float(mel_loss.item()), global_step)
+            log_value("linear loss", float(linear_loss.item()), global_step)
             log_value("gradient norm", grad_norm, global_step)
             log_value("learning rate", current_lr, global_step)
 
             global_step += 1
-            running_loss += loss.data[0]
+            running_loss += loss.item()
 
         averaged_loss = running_loss / (len(data_loader))
         log_value("loss (per epoch)", averaged_loss, global_epoch)
